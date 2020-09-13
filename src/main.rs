@@ -1,6 +1,7 @@
 use std::io::{Cursor, Write};
 use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
+use std::time::Instant;
 use serialport::SerialPortType;
 use hyper::{
     Request,
@@ -43,14 +44,14 @@ impl Color {
 impl std::ops::Mul<Color> for f32 {
     type Output = Color;
     fn mul(self, value: Color) -> Color {
-        Color(value.0 * self, value.1 * self, value.2 * self)
+        Color((value.0 * self).max(0.).min(1.), (value.1 * self).max(0.).min(1.), (value.2 * self).max(0.).min(1.))
     }
 }
 
 impl std::ops::Add<Color> for Color {
     type Output = Color;
     fn add(self, value: Color) -> Color {
-        Color(self.0 + value.0, self.1 + value.1, self.2 + value.2)
+        Color((self.0 + value.0).max(0.).min(1.), (self.1 + value.1).max(0.).min(1.), (self.2 + value.2).max(0.).min(1.))
     }
 }
 
@@ -66,8 +67,8 @@ impl ColorFormat {
 
                 for c in colors {
                     let (r, g, b) = c.as_byte_color();
-                    bytes.push(r);
                     bytes.push(g);
+                    bytes.push(r);
                     bytes.push(b);
                 }
 
@@ -178,10 +179,10 @@ struct Player {
     pub match_stats: Option<MatchStats>,
     pub name: String,
     pub observer_slot: Option<i32>,
-    pub state: PlayerState,
+    pub state: Option<PlayerState>,
     pub steamid: String,
-    pub team: String,
-    pub weapons: HashMap<String, Weapon>,
+    pub team: Option<String>,
+    pub weapons: Option<HashMap<String, Weapon>>,
 }
 
 #[derive(serde::Deserialize)]
@@ -214,10 +215,12 @@ struct GameState {
 impl GameState {
     pub fn active_weapon(&self) -> Option<(&str, &Weapon)> {
         if let Some(player) = &self.player {
-            for (k, w) in &player.weapons {
-                let w: &Weapon = w;
-                if w.state == "active" || w.state == "reloading" {
-                    return Some((k, w));
+            if let Some(weapons) = &player.weapons {
+                for (k, w) in weapons {
+                    let w: &Weapon = w;
+                    if w.state == "active" || w.state == "reloading" {
+                        return Some((k, w));
+                    }
                 }
             }
         }
@@ -250,13 +253,29 @@ fn fill(cols: &mut [Color], col: Color, alpha: f32) {
     }
 }
 
-fn draw_line(cols: &mut [Color], from: f32, to: f32, col: Color) {
+enum BlendMode {
+    Replace,
+    Mix,
+    Add,
+}
+
+impl BlendMode {
+    pub fn blend(&self, prev: &Color, new: &Color, alpha: f32) -> Color {
+        match self {
+            BlendMode::Replace => alpha * *new,
+            BlendMode::Mix => (1. - alpha) * *prev + alpha * *new,
+            BlendMode::Add => *prev + alpha * *new,
+        }
+    }
+}
+
+fn draw_line(cols: &mut [Color], from: f32, to: f32, col: Color, blend: BlendMode) {
     for i in usize::max(f32::floor(from) as usize, 0) .. usize::min(f32::ceil(to) as usize, cols.len()) {
         let amt = f32::min(f32::max(i as f32 + 1.0 - from, 0.0), 1.0)
             + f32::min(f32::max(to - i as f32, 0.0), 1.0)
             - 1.0;
 
-        cols[i] = (1. - amt) * cols[i] + amt * col;
+        cols[i] = blend.blend(&cols[i], &col, amt);
     }
 }
 
@@ -272,7 +291,7 @@ fn merge(a: &mut serde_json::Value, b: serde_json::Value) {
     }
 }
 
-async fn handle_http(mut req: Request<Body>, state: Arc<Mutex<GameState>>, next_event: Arc<Mutex<Option<EventType>>>) -> Result<Response<Body>, std::convert::Infallible> {
+async fn handle_http(mut req: Request<Body>, state: Arc<Mutex<GameState>>, next_event: Arc<Mutex<Vec<EventType>>>) -> Result<Response<Body>, std::convert::Infallible> {
     let mut bytes = Vec::with_capacity(req.body().size_hint().lower() as usize);
     loop {
         if let Some(Ok(data)) = req.body_mut().data().await {
@@ -288,19 +307,77 @@ async fn handle_http(mut req: Request<Body>, state: Arc<Mutex<GameState>>, next_
         *guard = serde_json::from_reader(std::io::BufReader::new(Cursor::new(bytes))).unwrap();
 
         if let Some(map) = &(*guard).previously {
-            if let Some((k, w)) = (*guard).active_weapon() {
-                if let Some(ammo_clip) = w.ammo_clip {
-                    if let Some(prev_player) = map.get("player") {
-                        if let Some(prev_weapons) = prev_player.get("weapons") {
-                            if let Some(prev_weapon) = prev_weapons.get(k) {
-                                if prev_weapon.get("state").is_none() {
-                                    if let Some(prev_ammo) = prev_weapon.get("ammo_clip") {
-                                        if ammo_clip < prev_ammo.as_i64().unwrap() as i32 {
-                                            *next_event.lock().unwrap() = Some(EventType::Shoot);
+            if let Some(player) = &(*guard).player {
+                if let Some(prev_player) = map.get("player") {
+                    let prev_steamid = prev_player.get("steamid");
+                    if prev_steamid.is_none() || prev_steamid.unwrap().as_str().unwrap() == player.steamid {
+                        if let Some((k, w)) = (*guard).active_weapon() {
+                            if let Some(prev_weapons) = prev_player.get("weapons") {
+                                if let Some(prev_weapon) = prev_weapons.get(k) {
+                                    if if let Some(prev_state) = prev_weapon.get("state") {
+                                        if prev_state == "holstered" {
+                                            next_event.lock().unwrap().push(EventType::SwitchWeapon);
+                                            false
+                                        } else {
+                                            true
+                                        }
+                                    } else {
+                                        true
+                                    } {
+                                        if let Some(ammo_clip) = w.ammo_clip {
+                                            if let Some(prev_ammo) = prev_weapon.get("ammo_clip") {
+                                                if ammo_clip < prev_ammo.as_i64().unwrap() as i32 {
+                                                    next_event.lock().unwrap().push(EventType::Shoot);
+                                                }
+                                            }
                                         }
                                     }
                                 }
                             }
+                        }
+    
+                        if let Some(prev_state) = prev_player.get("state") {
+                            if let Some(state) = &player.state {
+                                if let Some(prev_health) = prev_state.get("health") {
+                                    if state.health == 0. && prev_health.as_f64().unwrap() != 0. {
+                                        next_event.lock().unwrap().push(EventType::Death);
+                                    }
+                                }
+                            }
+                        }
+    
+                        if let Some(prev_stats) = prev_player.get("match_stats") {
+                            if let Some(stats) = &player.match_stats {
+                                if let Some(prev_mvps) = prev_stats.get("mvps") {
+                                    if stats.mvps > prev_mvps.as_i64().unwrap() as i32 {
+                                        next_event.lock().unwrap().push(EventType::MVP);
+                                    }
+                                }
+
+                                if let Some(prev_kills) = prev_stats.get("kills") {
+                                    if stats.kills > prev_kills.as_i64().unwrap() as i32 {
+                                        if let Some((_, w)) = (*guard).active_weapon() {
+                                            if w.r#type == "Knife" {
+                                                next_event.lock().unwrap().push(EventType::KnifeKill);
+                                            } else {
+                                                next_event.lock().unwrap().push(EventType::Kill);
+                                            }
+                                        } else {
+                                            next_event.lock().unwrap().push(EventType::Kill);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Some(round) = &(*guard).round {
+                if let Some(prev_round) = map.get("round") {
+                    if let Some(prev_phase) = prev_round.get("phase") {
+                        if round.phase == "freezetime" && prev_phase.as_str().unwrap() == "over" {
+                            next_event.lock().unwrap().push(EventType::NewRound);
                         }
                     }
                 }
@@ -323,17 +400,26 @@ fn do_rainbow(cols: &mut [Color], time: f64, cycle_time: f64, alpha: f32) {
 
 type Event = (EventType, f64);
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum EventType {
     Shoot,
     Kill,
     KnifeKill,
+    SwitchWeapon,
+    Death,
+    MVP,
+    NewRound,
 }
 
-fn do_lights(serial: &str, state: Arc<Mutex<GameState>>, next_event: Arc<Mutex<Option<EventType>>>) {
-    let start = std::time::Instant::now();
+static COLOR_CT: Color = Color(0.1, 0.3, 1.0);
+static COLOR_T: Color = Color(1.0, 0.5, 0.1);
+
+fn do_lights(serial: &str, state: Arc<Mutex<GameState>>, next_event: Arc<Mutex<Vec<EventType>>>) {
+    let start = Instant::now();
+    let mut knife_start = Instant::now();
 
     let mut last_event: Option<Event> = None;
+    let mut kill_event: Option<Event> = None;
 
     let mut serial = serialport::open_with_settings(serial, &serialport::SerialPortSettings {
         baud_rate: 250000,
@@ -346,38 +432,91 @@ fn do_lights(serial: &str, state: Arc<Mutex<GameState>>, next_event: Arc<Mutex<O
 
     let mut cols = [Color(0.0, 0.0, 1.0); 60];
     let s = &mut serial;
+
+    let mut mvp = false;
+
     loop {
-        let time_now = (std::time::Instant::now() - start).as_secs_f64();
+        let now = Instant::now();
+        let time_now = (now - start).as_secs_f64();
         {
-            let mut guard = next_event.lock().unwrap();
-            if let Some(e) = &*guard {
-                last_event = Some((*e, time_now));
-                *guard = None;
+            for e in next_event.lock().unwrap().drain(..) {
+                println!("{:?}", e);
+                match e {
+                    EventType::SwitchWeapon => knife_start = now,
+                    EventType::MVP => mvp = true,
+                    EventType::NewRound => mvp = false,
+                    e @ EventType::Shoot | e @ EventType::Death | e @ EventType::Kill => last_event = Some((e, time_now)),
+                    e @ EventType::KnifeKill => kill_event = Some((e, time_now)),
+                    _ => (),
+                }
             }
         }
 
         {
             let guard = state.lock().unwrap();
             let state: &GameState = &*guard;
-            if let Some((_k, w)) = state.active_weapon() {
-                if w.r#type == "Knife" {
-                    let cycle = (time_now % 1. + 1.) % 1.;
-                    let amt = if cycle < 0.25 {
-                        0.5 - cycle * 2.
-                    } else if cycle < 0.5 {
-                        0.5 - cycle
+    
+            clear(&mut cols);
+
+            if let Some(map) = &state.map {
+                println!("Map: {}", map.phase);
+                if let Some(round) = &state.round {
+                    if round.phase == "freezetime" {
+                        if let Some(wins) = &map.round_wins {
+                            let mut w: Vec<usize> = wins.keys().map(|v| v.parse().unwrap()).collect();
+                            w.sort();
+                            let w: Vec<String> = w.iter().map(|v| v.to_string()).collect();
+        
+                            for i in 0..w.len() {
+                                draw_line(&mut cols, i as f32 * 60. / w.len() as f32, 60., if wins[&w[i]].starts_with("ct_") { COLOR_CT } else { COLOR_T }, BlendMode::Mix);
+                            }
+                        }
+                    } else if mvp {
+                        do_rainbow(&mut cols, time_now, 1., 1.);
+                    } else if let Some(team) = &round.win_team {
+                        fill(&mut cols, if team == "CT" { COLOR_CT } else { COLOR_T }, 1.);
                     } else {
-                        0.
-                    };
-
-                    do_rainbow(&mut cols, time_now, 1., amt as f32);
-                } else if let Some(ammo_clip) = w.ammo_clip {
-                    let ammo = (ammo_clip as f64 / w.ammo_clip_max.unwrap() as f64) as f32;
-
-                    clear(&mut cols);
-                    do_rainbow(&mut cols, time_now, 1., 0.5);
-                    let len = cols.len();
-                    draw_line(&mut cols, len as f32 * ammo, len as f32, Color(0., 0., 0.))
+                        if let Some(player) = &state.player {
+                            if let Some((_k, w)) = state.active_weapon() {
+                                if w.r#type == "Knife" {
+                                    let knife_time = (now - knife_start).as_secs_f64();
+                                    let cycle = (knife_time % 1.321 + 1.321) % 1.321;
+                                    let amt = if cycle < 0.25 {
+                                        0.5 - cycle * 2.
+                                    } else if cycle < 0.5 {
+                                        0.5 - cycle
+                                    } else {
+                                        0.
+                                    };
+                
+                                    fill(&mut cols, Color(0.2, 0., 0.), amt as f32);
+                                } else if w.r#type == "C4" {
+                                    let c4_time = (now - knife_start).as_secs_f64() / 0.25;
+                                    let cycle = (c4_time % 1. + 1.) % 1.;
+                                    let amt = if cycle < 0.5 {
+                                        cycle * 2.
+                                    } else {
+                                        2. - cycle * 2.
+                                    } * 0.75 + 0.25;
+                
+                                    fill(&mut cols, Color(0.1, 0.1, 0.), amt as f32);
+                                } else if let Some(ammo_clip) = w.ammo_clip {
+                                    if let Some(state) = &player.state {
+                                        let ammo = (ammo_clip as f64 / w.ammo_clip_max.unwrap() as f64) as f32;
+                                        let health = state.health / 100.;
+                                        let armor = state.armor / 100.;
+                    
+                                        let len = cols.len();
+                                        draw_line(&mut cols, 0., len as f32 * ammo, Color(0.5, 0., 0.), BlendMode::Add);
+                                        draw_line(&mut cols, 0., len as f32 * health, Color(0., 0.5, 0.), BlendMode::Add);
+                                        draw_line(&mut cols, 0., len as f32 * armor, Color(0., 0., 0.5), BlendMode::Add);
+                                    }
+                                } else {
+                                    println!("{}", w.r#type);
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
@@ -386,8 +525,45 @@ fn do_lights(serial: &str, state: Arc<Mutex<GameState>>, next_event: Arc<Mutex<O
                 match event {
                     EventType::Shoot => {
                         fill(&mut cols, Color(1., 1., 0.25), (1.0 - since * 8.).max(0.) as f32);
+                        if since > 0.125 {
+                            last_event = None;
+                        }
+                    },
+                    EventType::Death => {
+                        clear(&mut cols);
+                        fill(&mut cols, Color(1., 0., 0.), (1.0 - since * 0.25).max(0.) as f32);
+                        if since > 4. {
+                            last_event = None;
+                        }
+                    },
+                    EventType::Kill => {
+                        fill(&mut cols, Color(1., 1., 0.), (1.0 - since).max(0.) as f32);
+                        if since > 1. {
+                            last_event = None;
+                        }
                     },
                     _ => (),
+                }
+            }
+
+            if let Some((event, time)) = &kill_event {
+                let since = time_now - time;
+                match event {
+                    EventType::KnifeKill => {
+                        do_rainbow(&mut cols, time_now, 1., (2.0 - since * 0.5).max(0.) as f32);
+                        if since > 1. {
+                            last_event = None;
+                        }
+                    },
+                    _ => (),
+                }
+            }
+
+            if let Some(player) = &state.player {
+                if let Some(state) = &player.state {
+                    if state.flashed > 0. {
+                        fill(&mut cols, Color(1., 1., 1.), state.flashed / 255.);
+                    }
                 }
             }
         }
@@ -425,7 +601,7 @@ async fn main() -> std::io::Result<()> {
     println!("Beginning to send data on {}", port_name);
 
     let state = Arc::new(Mutex::new(GameState::default()));
-    let next_event = Arc::new(Mutex::new(None));
+    let next_event = Arc::new(Mutex::new(Vec::new()));
 
     let s1 = Arc::clone(&state);
     let e1 = Arc::clone(&next_event);
